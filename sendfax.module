@@ -1,0 +1,288 @@
+<?php
+/**
+ * @file
+ * Pierre Bastoul (@hiousi)
+ * freepbx ARI module to send a fax uploaded from web 
+ * http://code.google.com/p/webfax-ari-module
+ * require digium's FFA
+ * 
+ * a refork of Web Fax for Asterisk php script written by recluze (http://csrdu.org/nauman) 
+ * 
+ */
+
+/**
+
+short help
+First download and setup Free Fax for Asterisk (FFA) from Digium Store http://store.digium.com
+Install the Fax module on Freepbx, it will help you configure inbound faxing. Test incoming faxes.
+Copy sendfax.module to /%AMPROOT%/recordings/modules/sendfax.module
+Copy sendfaxnotify.php to ${ASTVARLIBDIR}/bin/sendfaxnotify.php
+Change the two files to be owned by the user running Asterisk.
+Create the following context in /etc/asterisk/extensions_custom.conf and reload asterisk
+
+[outboundfax]
+exten => s,1,Set(FAXOPT(filename)=${FAXFILE})
+exten => s,n,Set(FAXOPT(ecm)=yes)
+exten => s,n,Set(FAXOPT(headerinfo)=${FAXHEADER})
+exten => s,n,Set(FAXOPT(localstationid)=${LOCALID})
+exten => s,n,Set(FAXOPT(maxrate)=14400)
+exten => s,n,Set(FAXOPT(minrate)=2400)
+exten => s,n,SendFAX(${FAXFILE},d)
+exten => s,n,System(${ASTVARLIBDIR}/bin/sendfaxnotify.php INIT "${EMAIL}" "${DESTINATION}" "${TIMESTAMP}" "NO_STATUS" "NO_PAGES")
+exten => h,1,NoOp(FAXOPT(ecm) : ${FAXOPT(ecm)})
+exten => h,n,NoOp(FaxStatus : ${FAXSTATUS})
+exten => h,n,NoOp(FaxStatusString : ${FAXSTATUSSTRING})
+exten => h,n,NoOp(FaxError : ${FAXERROR})
+exten => h,n,NoOp(RemoteStationID : ${REMOTESTATIONID})
+exten => h,n,NoOp(FaxPages : ${FAXPAGES})
+exten => h,n,NoOp(FaxBitRate : ${FAXBITRATE})
+exten => h,n,NoOp(FaxResolution : ${FAXRESOLUTION})
+exten => h,n,System(${ASTVARLIBDIR}/bin/sendfaxnotify.php NOTIFY "${EMAIL}" "${DESTINATION}" "${TIMESTAMP}" "${FAXSTATUSSTRING}" "${FAXPAGES}")
+; end of outboundfax context
+
+
+
+ */
+ 
+
+
+
+//*****************************************************************************
+class SendFax {
+	
+	var $outbound_route = "outbound-allroutes"; // outbound route name 	
+	var $outboundfax_context = "outboundfax"; // oubound fax context
+	var $asterisk_spool_folder = "/var/spool/asterisk/outgoing"; 
+
+//*****************************************************************************
+  function rank() {
+    $rank = 3;
+    return $rank;
+  }
+
+//*****************************************************************************
+  function init() {
+  }
+//*****************************************************************************
+  function navMenu($args) {
+      $ret .= "
+        <p><small><small><a href='" . $_SESSION['ARI_ROOT'] . "?m=SendFax&f=display'>" . _("Send Fax") . "</a></small></small></p>";
+
+    return $ret;
+  }
+//*****************************************************************************
+  function action($args) {
+
+    // args
+    $m = getArgument($args,'m');
+    $a = getArgument($args,'a');;
+	$POST=array(
+		'faxHeader' =>	 getArgument($args,'faxHeader'),
+		'localID' =>  	 getArgument($args,"localID"),
+		'email' =>  	 getArgument($args,"email"),
+		'dest' => 		 getArgument($args,"dest")
+	);
+
+
+	if ($a=='send') {	
+		$_SESSION['ari_error'] = "";
+		
+		$POST['localID']=str_replace(' ', '', $POST['localID']);
+		if (!preg_match('/^[0-9\+]+$/',$POST['localID'])) {
+			$_SESSION['ari_error'] .= _("Check Local Station Identifier, no specials characters please") . "<br />" ;
+		}
+		
+		$POST['dest']=str_replace(' ', '', $POST['dest']);
+		if ($POST['dest']=="") {
+			$_SESSION['ari_error'] .= _("You must give a destination Fax number") . "<br />" ;
+		} elseif (!preg_match('/^[0-9\+]+$/',$POST['dest'])) {
+			$_SESSION['ari_error'] .= _("Check destination Fax number, only digits.") . "<br />" ;
+		}
+		
+		if (!preg_match('/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,6}$/i',$POST['email'])) {
+			$_SESSION['ari_error'] .= _("Email is used to notify you on fax success, please re-check it.") . "<br />" ;
+		} 
+		
+		$args=array("m"=>$m,"form"=>$POST);
+		
+		if ($_SESSION['ari_error']) return $this->display($args);
+		
+		// prepare file
+		$file=$this->getFile($args);
+		if ($file) {
+			//creating a call file and write it in /tmp
+			$callfile = "Channel: Local/".$POST['dest']."@".$this->outbound_route."\n" . 
+						"MaxRetries: 1\n" . 
+						"RetryTime: 60\n" . 
+						"WaitTime: 60\n"  . 
+						"Archive: yes\n"  . 
+						"Context: ".$this->outboundfax_context."\n"  . 
+						"Extension: s\n" . 
+						"Priority: 1\n" . 
+						"Set: FAXFILE=".$file."\n" . 
+						"Set: FAXHEADER=".$POST['faxHeader']."\n" . 
+						"Set: TIMESTAMP=" . date("d/m/y : H:i:s",time()) . "\n" .
+						"Set: DESTINATION=".$POST['dest']."\n". 
+						"Set: LOCALID=".$POST['localID']."\n" . 
+						"Set: EMAIL=".$POST['email']."\n";
+		
+			$callfilename = "/tmp/".mt_rand(). ".call"; 
+			$f = fopen($callfilename, "w"); 
+			fwrite($f, $callfile); 
+			fclose($f); 
+			// move file to spool
+			rename($callfilename, $this->asterisk_spool_folder .  "/" . substr($callfilename,4));
+		} 
+	}
+	
+	if ($_SESSION['ari_error']) {
+			// display errors and form
+			return $this->display($args);
+	} else {
+			return $this->getHeader()."<table width=\"400\" class=\"settings\" border=\"0\" cellpadding=\"0\" cellspacing=\"0\"><tr><td>".
+					"<p>Your fax sending has been initiated. You should receive an email shortly ". 
+					" when the fax reaches the queue. If you don't receive an email in 10 minutes, ". 
+					" there has been a problem with sending your fax and you should try again.</p></td></tr></table>"; 
+	}
+	
+
+  }
+//*****************************************************************************
+function getFile() {
+		$input_file_orig_name = basename($_FILES['faxFile']['name']); 
+		$ext = substr($input_file_orig_name, strrpos($input_file_orig_name, '.') + 1);
+		if (!preg_match('/^TIF|PDF$/', strtoupper ($ext))) {
+			$_SESSION['ari_error'] .= _("Check your file please, either <strong>PDF</strong> or <strong>TIF</strong>") . "<br />" ;
+			return false;
+		}
+		
+		$unique_name = "/tmp/".mt_rand(); 
+ 	
+		if (strtoupper($ext) == "TIF") {
+			$input_file_tif = $unique_name . ".tif";
+			if (!move_uploaded_file($_FILES['faxFile']['tmp_name'], $input_file_tif)) {
+				$_SESSION['ari_error'] .= _("There was an error uploading your TIF file, please try again!")."<br />";
+				return false;
+			}
+		} elseif (strtoupper($ext) == "PDF")  {
+			$input_file = $unique_name . ".pdf";
+			$input_file_tif = $unique_name . ".tif";
+			if(!move_uploaded_file($_FILES['faxFile']['tmp_name'], $input_file)) {
+				$_SESSION['ari_error'] .= _("There was an error uploading the file, please try again!") . "<br />" ;
+				return false;
+			} else {
+				// convert the attached PDF to .tif using ghostsccript ...
+				$gs_command = "gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=tiffg3 -sOutputFile=${input_file_tif} -f $input_file " ;
+				$gs_command_output = system($gs_command, $retval);
+				$doc_convert_output = $gs_command_output;
+				if ($retval != 0) {
+					$_SESSION['ari_error'] .= _("There was an error converting your PDF file. Try uploading the file again or with an older version of PDF") . "<br />" ; 
+					return false;
+				}
+			}
+		} 
+		return $input_file_tif;
+
+} 
+//*****************************************************************************
+function saveConfig($vars) {
+	if (is_array($vars)) {
+		foreach ($vars as $name => $value) {        
+			setcookie("ari_fax[$name]", $value, time()+365*24*60*60);
+		}
+	}
+}
+
+//*****************************************************************************
+function getConfig() {
+	return $_COOKIE['ari_fax'];
+}
+//*****************************************************************************
+function getHeader() {
+	if ($_SESSION['ari_user']['admin_settings']) {
+		$headerText = _("Send Fax");
+	} else {
+		$headerText = sprintf(_("Send Fax for %s (%s)"),$_SESSION['ari_user']['displayname'],$_SESSION['ari_user']['extension']);
+	}
+	$display= new Display();
+	$ret = $display->displayHeaderText($headerText);
+	$ret .= $display->displayLine();
+	return $ret;
+}
+//*****************************************************************************
+function getForm($v) {
+	$ret .= '
+	<table width="400"  class="settings" border="0" cellpadding="0" cellspacing="0"><tr>
+			<td><p>Please use the form below to input the required information and click on &quot;Send FAX&quot; below.
+					You will receive a notification about the status of your fax through the email you provide below. </p>
+			</td>
+	</tr></table>
+	'.checkErrorMessage().'
+	<!-- FORM_START --> 
+    <form action="" method="post" enctype="multipart/form-data" name="form1" id="form1">
+      <table  class="settings" border="0" cellpadding="0" cellspacing="0">
+        <tr>
+			<td><a href="#" class="info">Fax Header:<span>Type the header text you want to appear at the top of your FAX.</span></a></td>
+			<td><input name="faxHeader" type="text" id="faxHeader" value="'.$v['faxHeader'].'" /></td>
+        </tr>
+        <tr>
+			<td><a href="#" class="info">Local Station Identifier:<span>This field is required. Enter the number that should be used as the sender\'s FAX number.</span></a></td>
+			<td><input name="localID" type="text" id="localID" value="'.$v['localID'].'" /></td>
+	   </tr>
+        <tr>
+			<td><a href="#" class="info">Notification Email Address:<span>This field is required. Enter the email to which FAX notifications would be sent. If you don\'t receive <strong>any</strong> email on this address after sending the FAX, it means we probably don\'t have access to the destination number. For example, if you are trying to send a FAX to Europe when we only have trunks for US/Canada.</span></a></td>
+			<td><input name="email" type="text" id="email" value="'.$v['email'].'" /></td>
+        </tr>
+        <tr>
+          <td><a href="#" class="info">FAX Destination:<span>This field is required. Destination FAX number. Please do not include any spaces or special characters.</span></a></td>
+          <td><input name="dest" type="text" id="dest" value="'.$v['dest'].'" /></td>
+        </tr>
+        <tr>
+		 <td><a href="#" class="info">Attach file:<span>Filetypes acceptable: <strong>PDF</strong> , <strong>TIF</strong></span></a></td>
+         <td><input type="file" name="faxFile" id="faxFile" /></td>
+        </tr>
+        <tr>
+          <td>
+				<input type="submit" name="sendFax" id="sendFax" value="Send FAX" />
+		  		<input type="hidden" name="f" value="action" />
+				<input type="hidden" name="a" value="send" />
+		  
+		  </td>
+          <td>&nbsp;</td>
+        </tr>
+      </table>
+    </form>
+    <!-- FORM_END -->';
+	return $ret;
+}
+
+
+
+function display($args) {
+
+    // args
+    //$m = getArgument($args,'m');
+    //$a = getArgument($args,'a');
+	$form = getArgument($args,'form');
+
+	$form = (isset($form)) ? $form : $this->getConfig();
+
+	// try to set some default values
+	$displayname = $_SESSION['ari_user']['displayname'];
+	$exten = $_SESSION['ari_user']['extension'];
+	$voicemail = $_SESSION['ari_user']['voicemail_email_address'];
+	if (!$_SESSION['ari_user']['admin_settings']) {
+		if (!$form['faxHeader']) $form['faxHeader'] = "from ".$displayname. " (". $voicemail.")";
+		if (!$form['localID']) $form['localID'] = $exten;
+		if (!$form['email']) $form['email'] = $voicemail;
+	}
+	// build page content
+	$ret = $this->getHeader().$this->getForm($form);
+	return $ret;
+}
+
+
+
+
+} // class
+?>
